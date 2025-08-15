@@ -1,32 +1,49 @@
+# Core dependencies (choose correct PyTorch build for your CUDA)
+torch>=1.8.0
+torchvision
+torchaudio
+
+# Octree and numerical computing
 ocnn
-h5py
-termcolor
-scipy
-einops
-tqdm
-matplotlib
-opencv-python
-PyMCubes
-imageio
-trimesh
-omegaconf
-tensorboard
-notebook
 numpy
+scipy
+
+# Scientific and I/O
+h5py
+omegaconf
+termcolor
 tqdm
 yacs
-scipy
-plyfile
-tensorboard
-scikit-image
-trimesh
-wget
-mesh2sdf
-matplotlib
-objaverse
+einops
 pandas
-kornia
-ftfy
-regex
-timm
-open3d
+
+# Imaging and 3D geometry
+opencv-python
+matplotlib
+imageio
+trimesh
+plyfile
+scikit-image
+pillow
+
+# Rendering/visualization (optional)
+pyrender
+pyglet
+pyrr
+PyOpenGL
+
+# Medical imaging and graph utils
+nibabel
+networkx
+
+# Logging / notebook
+tensorboard
+notebook
+
+# Optional packages (uncomment if you actually use them)
+# open3d
+# mesh2sdf
+# objaverse
+# kornia
+# timm
+# wget
