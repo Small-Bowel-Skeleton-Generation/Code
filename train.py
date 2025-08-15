@@ -2,261 +2,200 @@ import os
 import time
 import inspect
 import random
-
+from datetime import datetime
 from termcolor import colored, cprint
 from tqdm import tqdm
-
+import torch
 import torch.backends.cudnn as cudnn
-# cudnn.benchmark = True
+import torch.multiprocessing as mp
 
 from options.train_options import TrainOptions
 from datasets.dataloader import config_dataloader, get_data_generator
 from models.base_model import create_model
-
-import torch.multiprocessing
-torch.multiprocessing.set_sharing_strategy('file_descriptor')
-
-from utils.distributed import (
-    get_rank,
-    synchronize,
-    reduce_loss_dict,
-    reduce_sum,
-    get_world_size,
-)
-
-from utils.util import seed_everything, category_5_to_label, category_5_to_num
-
-import torch
+from utils.distributed import get_rank, synchronize, get_world_size
+from utils.util import seed_everything, category_5_to_num, category_5_to_label
 from utils.visualizer import Visualizer
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-def train_main_worker(opt, model, train_loader, test_loader, visualizer):
-
+def train_worker(opt, model, train_loader, test_loader, visualizer):
+    """Main training worker function."""
     if get_rank() == 0:
-        cprint('[*] Start training. name: %s' % opt.name, 'blue')
+        cprint(f'[*] Starting training for experiment: {opt.name}', 'blue')
 
-    train_dg = get_data_generator(train_loader)
-    test_dg = get_data_generator(test_loader)
-
+    train_data_generator = get_data_generator(train_loader)
+    test_data_generator = get_data_generator(test_loader)
+    
     epoch_length = len(train_loader)
-    print('The epoch length is', epoch_length)
+    cprint(f'Epoch length: {epoch_length}', 'cyan')
 
     total_iters = epoch_length * opt.epochs
     start_iter = opt.start_iter
-
     epoch = start_iter // epoch_length
 
-    # pbar = tqdm(total=total_iters)
-    pbar = tqdm(range(start_iter, total_iters))
-
+    pbar = tqdm(range(start_iter, total_iters), disable=(get_rank() != 0))
     iter_start_time = time.time()
-    for iter_i in range(start_iter, total_iters):
 
-        opt.iter_i = iter_i
-        iter_ip1 = iter_i + 1
+    for current_iter in pbar:
+        opt.iter_i = current_iter
+        next_iter = current_iter + 1
 
         if get_rank() == 0:
             visualizer.reset()
 
-        data = next(train_dg)
-        data['iter_num'] = iter_i
+        data = next(train_data_generator)
+        data['iter_num'] = current_iter
         data['epoch'] = epoch
         model.set_input(data)
         model.optimize_parameters()
 
-        # if torch.isnan(model.loss).any() == True:
-        #     break
-
         if get_rank() == 0:
-            pbar.update(1)
-            if iter_i % opt.print_freq == 0:
+            if current_iter % opt.print_freq == 0:
                 errors = model.get_current_errors()
+                elapsed_time = (time.time() - iter_start_time) / opt.batch_size
+                visualizer.print_current_errors(current_iter, errors, elapsed_time)
 
-                t = (time.time() - iter_start_time) / opt.batch_size
-                visualizer.print_current_errors(iter_i, errors, t)
+            if next_iter % opt.save_latest_freq == 0:
+                cprint(f'Saving the latest model (iteration {current_iter})', 'blue')
+                model.save('steps-latest', next_iter)
 
-            if iter_ip1 % opt.save_latest_freq == 0:
-                cprint('saving the latest model (current_iter %d)' % (iter_i), 'blue')
-                latest_name = f'steps-latest'
-                model.save(latest_name, iter_ip1)
+            if next_iter % opt.save_steps_freq == 0:
+                cprint(f'Saving the model at iteration {next_iter}', 'blue')
+                model.save(f'steps-{next_iter}', next_iter)
+                cprint(f'[*] End of step {next_iter} \t Time Taken: {time.time() - iter_start_time:.2f} sec',
+                       'blue', attrs=['bold'])
 
-            # save every 3000 steps (batches)
-            if iter_ip1 % opt.save_steps_freq == 0:
-                cprint('saving the model at iters %d' % iter_ip1, 'blue')
-                latest_name = f'steps-latest'
-                model.save(latest_name, iter_ip1)
-                cur_name = f'steps-{iter_ip1}'
-                model.save(cur_name, iter_ip1)
+        if current_iter % epoch_length == epoch_length - 1:
+            epoch += 1
+            cprint(f'Finished epoch {epoch - 1}. Starting epoch {epoch}.', 'green')
 
-                cprint(f'[*] End of steps %d \t Time Taken: %d sec \n%s' %
-                    (
-                        iter_ip1,
-                        time.time() - iter_start_time,
-                        os.path.abspath(os.path.join(opt.logs_dir, opt.name))
-                    ), 'blue', attrs=['bold']
-                )
-
-            if iter_i % epoch_length == epoch_length - 1:
-                print('Finish One Epoch!')
-                epoch += 1
-                print('Now Epoch is:', epoch)
-
-        # display every n batches
-        if iter_i % opt.display_freq == 0:
-            if iter_i == 0 and opt.debug == "0":
-                pbar.update(1)
-                continue
-
-            # eval
+        if current_iter % opt.display_freq == 0 and (current_iter > 0 or opt.debug == "1"):
             if opt.model == "vae":
-                data = next(test_dg)
-                data['iter_num'] = iter_i
-                data['epoch'] = epoch
-                model.set_input(data)
-                model.inference(save_folder = f'temp/{iter_i}')
+                eval_data = next(test_data_generator)
+                eval_data['iter_num'] = current_iter
+                eval_data['epoch'] = epoch
+                model.set_input(eval_data)
+                model.inference(save_folder=f'temp/{current_iter}')
             else:
-                if opt.category == "im_5":
-                    category = random.choice(list(category_5_to_num.keys()))
-                else:
-                    category = opt.category
-                
-                model.sample(category = category, prefix = 'results', ema = True, ddim_steps = 500, save_index = iter_i, cond=opt.cond, cond_dir=opt.cond_dir)
-            
-            # torch.cuda.empty_cache()
+                category = random.choice(list(category_5_to_num.keys())) if opt.category == "im_5" else opt.category
+                model.sample(category=category, prefix='results', ema=True, ddim_steps=200,
+                             save_index=current_iter, cond=opt.cond, cond_dir=opt.cond_dir, iter_i=current_iter)
 
         if opt.update_learning_rate:
             model.update_learning_rate_cos(epoch, opt)
 
-        
 
-def generate_vae(opt, model, test_loader):
+def generate_vae_samples(opt, model, test_loader):
+    """Generates samples from a VAE model."""
     if get_rank() == 0:
-        cprint('[*] Start training. name: %s' % opt.name, 'blue')
+        cprint(f'[*] Starting VAE sample generation for: {opt.name}', 'blue')
 
-    test_dg = get_data_generator(test_loader)
+    test_data_generator = get_data_generator(test_loader)
+    num_samples = len(test_loader)
+    pbar = tqdm(range(num_samples), disable=(get_rank() != 0))
 
-    epoch_length = len(train_loader)
-    print('The epoch length is', epoch_length)
-
-    total_iters = epoch_length
-    start_iter = 0
-
-    # pbar = tqdm(total=total_iters)
-    pbar = tqdm(range(start_iter, total_iters))
-
-    for iter_i in range(start_iter, total_iters):
-
-        data = next(test_dg)
-        data['iter_num'] = iter_i
+    for i in pbar:
+        data = next(test_data_generator)
+        data['iter_num'] = i
         data['epoch'] = 0
         model.set_input(data)
         seed_everything(opt.seed)
         model.inference()
-        pbar.update
+        pbar.set_description(f"Generated sample {i+1}/{num_samples}")
 
 
-def generate(opt, model):
+def generate_diffusion_samples(opt, model):
+    """Generates samples from a diffusion model."""
+    if get_rank() == 0:
+        cprint(f'[*] Starting diffusion model sample generation for: {opt.name}', 'blue')
 
-    # get n_epochs here
-    total_iters = 100000000
-    pbar = tqdm(total=total_iters)
+    total_num = category_5_to_num.get(opt.category)
+    if total_num is None:
+        raise ValueError(f"Category '{opt.category}' not found in category_5_to_num map.")
 
-    total_num = category_5_to_num[opt.category]
+    pbar = tqdm(total=total_num, disable=(get_rank() != 0))
 
-    for iter_i in range(total_iters):
-
-        result_index = iter_i * get_world_size() + get_rank()
-        if opt.split_dir is not None:
-            split_path = os.path.join(opt.split_dir, f'{result_index}.pth')
-            split_small = torch.load(split_path)
-            split_small = split_small.to(model.device)
-        else:
-            split_small = None
-        model.batch_size = 1
-        
-        if result_index >= total_num: 
+    for i in range(total_num):
+        result_index = i * get_world_size() + get_rank()
+        if result_index >= total_num:
             break
 
-        if opt.category == "im_5":
-            category = random.choice(list(category_5_to_label.keys()))
-        else:
-            category = opt.category
-        model.sample(split_small = split_small, category = category, prefix = 'results', ema = False, ddim_steps = 500, clean = False, save_index = result_index, cond=opt.cond, cond_dir=opt.cond_dir)
+        split_small = None
+        if opt.split_dir:
+            split_path = os.path.join(opt.split_dir, f'{result_index}.pth')
+            if os.path.exists(split_path):
+                split_small = torch.load(split_path, map_location=model.device)
+        
+        model.batch_size = 1
+        category = random.choice(list(category_5_to_label.keys())) if opt.category == "im_5" else opt.category
+        
+        model.sample(split_small=split_small, category=category, prefix='results', ema=False,
+                     ddim_steps=200, clean=False, save_index=result_index, cond=opt.cond,
+                     cond_dir=opt.cond_dir, iter_i=i)
         pbar.update(1)
 
-if __name__ == "__main__":
-    # this will parse args, setup log_dirs, multi-gpus
+
+def backup_source_files(opt):
+    """Backs up essential source files to the experiment directory."""
+    expr_dir = os.path.join(opt.logs_dir, opt.name)
+    os.makedirs(expr_dir, exist_ok=True)
+    
+    files_to_backup = [
+        inspect.getfile(create_model.__globals__[opt.model.capitalize() + 'Model']),
+        "datasets/dualoctree_snet.py",
+        "train.py"
+    ]
+    
+    if opt.model != "vae" and hasattr(create_model(opt).df_module, '__class__'):
+         files_to_backup.append(inspect.getfile(create_model(opt).df_module.__class__))
+
+    if opt.vq_cfg:
+        files_to_backup.append(opt.vq_cfg)
+    if opt.df_cfg:
+        files_to_backup.append(opt.df_cfg)
+
+    for file_path in files_to_backup:
+        if os.path.exists(file_path):
+            destination_path = os.path.join(expr_dir, os.path.basename(file_path))
+            os.system(f'cp {file_path} {destination_path}')
+
+
+def main():
+    """Main entry point for training and generation."""
+    mp.set_sharing_strategy('file_descriptor')
+    
     opt = TrainOptions().parse_and_setup()
-    device = opt.device
-    rank = opt.rank
+    
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    opt.local_rank = local_rank
+    
+    if get_rank() == 0:
+        opt.exp_time = datetime.now().strftime('%Y-%m-%dT%H-%M')
+        cprint(f"Experiment time: {opt.exp_time}", "yellow")
 
-    # CUDA_VISIBLE_DEVICES = int(os.environ["LOCAL_RANK"])
-    # import pdb; pdb.set_trace()
-
-    # get current time, print at terminal. easier to track exp
-    from datetime import datetime
-    opt.exp_time = datetime.now().strftime('%Y-%m-%dT%H-%M')      
-
-    # main loop
     model = create_model(opt)
     opt.start_iter = model.start_iter
-    cprint(f'[*] "{opt.model}" initialized.', 'cyan')
+    cprint(f'[*] Model "{opt.model}" initialized.', 'cyan')
 
-    # visualizer
     visualizer = Visualizer(opt)
     if get_rank() == 0:
         visualizer.setup_io()
+        backup_source_files(opt)
 
-    # save model and dataset files
-    if get_rank() == 0:
-        expr_dir = '%s/%s' % (opt.logs_dir, opt.name)
-        model_f = inspect.getfile(model.__class__)
-        modelf_out = os.path.join(expr_dir, os.path.basename(model_f))
-        os.system(f'cp {model_f} {modelf_out}')
-        if opt.model != "vae":
-            unet_f = inspect.getfile(model.df_module.__class__)
-            unetf_out = os.path.join(expr_dir, os.path.basename(unet_f))
-            os.system(f'cp {unet_f} {unetf_out}')
-        dset_f = "datasets/dualoctree_snet.py"
-        dsetf_out = os.path.join(expr_dir, os.path.basename(dset_f))
-        os.system(f'cp {dset_f} {dsetf_out}')
-        sh_f = 'scripts/run_snet_uncond.sh'
-        sh_out = os.path.join(expr_dir, os.path.basename(sh_f))
-        os.system(f'cp {sh_f} {sh_out}')
-        train_f = 'train.py'
-        train_out = os.path.join(expr_dir, os.path.basename(train_f))
-        os.system(f'cp {train_f} {train_out}')
-        
-        if opt.vq_cfg is not None:
-            vq_cfg = opt.vq_cfg
-            cfg_out = os.path.join(expr_dir, os.path.basename(vq_cfg))
-            os.system(f'cp {vq_cfg} {cfg_out}')
-
-        if opt.df_cfg is not None:
-            df_cfg = opt.df_cfg
-            cfg_out = os.path.join(expr_dir, os.path.basename(df_cfg))
-            os.system(f'cp {df_cfg} {cfg_out}')
     if opt.mode == 'train':
-        # if opt.debug == "0":
-        #     # try:
-        #     #     train_main_worker(opt, model, train_loader, test_loader, visualizer)
-        #     # except:
-        #     #     import traceback
-        #     #     print(traceback.format_exc(), flush=True)
-        #     #     with open(os.path.join(opt.logs_dir, opt.name, "error.txt"), "a") as f:
-        #     #         f.write(traceback.format_exc() + "\n")
-        #     #     raise ValueError
-        # else:
         train_loader, test_loader = config_dataloader(opt)
-        train_main_worker(opt, model, train_loader, test_loader, visualizer)
+        train_worker(opt, model, train_loader, test_loader, visualizer)
     elif opt.mode == 'generate':
         if opt.model == "vae":
-            train_loader, test_loader = config_dataloader(opt)
-            generate_vae(opt, model, test_loader)
+            _, test_loader = config_dataloader(opt)
+            generate_vae_samples(opt, model, test_loader)
         else:
-            generate(opt, model)        
+            generate_diffusion_samples(opt, model)
     else:
-        raise ValueError
+        raise ValueError(f"Unknown mode: {opt.mode}")
+
+
+if __name__ == "__main__":
+    main()
 
 
