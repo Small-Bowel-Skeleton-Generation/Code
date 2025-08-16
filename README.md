@@ -86,6 +86,14 @@ Please update the script headers to match your environment, including dataset ro
 - YAML configuration files under configs/ specify dataset/model settings for different stages. During training, the active YAML files are copied into the experiment’s log directory for reproducibility.
 - Logs, checkpoints, and visual artifacts are stored under logs/<experiment_name>/.
 
+## Logs and Checkpoints (Download)
+
+Pre-collected logs (including checkpoints, copied YAML configs, and sample results) are available for download:
+
+- Google Drive: https://drive.google.com/drive/folders/1j3HB0JHNw9uWGZ_L78Axk5Ij19CpjgZU?usp=drive_link
+
+After downloading, place the extracted logs folder under the project root (i.e., <project_root>/logs) if you wish to reuse the provided checkpoints/config snapshots.
+
 ## Pre-Run Checklist
 - PyTorch is installed with a CUDA build matching your GPU drivers.
 - All Python dependencies from <mcfile name="requirements.txt" path="<path-to-your-code>/requirements.txt"></mcfile> are installed (some packages may require system libraries, e.g., OpenGL, VC++/X11, etc.).
