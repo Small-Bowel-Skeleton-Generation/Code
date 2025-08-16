@@ -552,7 +552,8 @@ class TreeDiffuisonModel(BaseModel):
         self.backward()
         self.optimizer.step()
         if self.is_train:
-            self.ema_updater.update(self.df)
+            # Update EMA weights for the diffusion model
+            self.ema_updater.update_model_average(self.ema_df, self.df)
 
     def get_current_errors(self):
         return {
