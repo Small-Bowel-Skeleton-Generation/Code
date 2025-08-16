@@ -15,7 +15,6 @@ from ocnn.nn import octree2voxel
 from einops import rearrange
 import os
 import scipy
-from models.networks.ounet_networks.unet import OUNet
 
 from models.networks.diffusion_networks.ldm_diffusion_util import (
     conv_nd,
@@ -118,13 +117,17 @@ class UNet3DModel(nn.Module):
 
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+        # Set input embedding and context modules
         if self.context_dim is not None:
-            self.multicnn = MultiCNN(down_ratio=8, last_level=4, out_channel=8)
-
-        self.input_emb = conv_nd(dims, self.in_channels, self.model_channels, 3, padding=1)
-
-        self.concat_emb = conv_nd(dims, 2 * self.model_channels, self.model_channels, 3, padding=1)
-
+            # 当使用 conditioning 时，也直接对完整的 LR 输入通道做 embedding，保持与旧 checkpoint 权重一致
+            self.input_emb = conv_nd(dims, self.in_channels, self.model_channels, 3, padding=1)
+            # Make context features match model_channels so they can be concatenated with embedded x
+            self.multicnn = MultiCNN(down_ratio=8, last_level=4, out_channel=self.model_channels)
+            self.concat_emb = conv_nd(dims, 2 * self.model_channels, self.model_channels, 3, padding=1)
+        else:
+            # No conditioning: embed full input channels directly
+            self.input_emb = conv_nd(dims, self.in_channels, self.model_channels, 3, padding=1)
+        
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
@@ -205,22 +208,24 @@ class UNet3DModel(nn.Module):
                 self.num_classes is not None
         ), "must specify label if and only if the model is class-conditional"
 
-        if not as_middle:
-            x = self.input_emb(x)
-
         h = []
 
         emb = self.time_emb(self.time_pos_emb(timesteps))
 
+        # LR stage: embed x first, then fuse context via concat_emb
+        if not as_middle:
+            # First embed x: (B, in_split_channels=8? or 4) -> (B, model_channels)
+            x = self.input_emb(x)
+            # If context provided, process to model_channels and fuse
+            if self.context_dim is not None and context is not None:
+                context = self.multicnn(context)
+                x = torch.cat((x, context), dim=1)  # (B, 2*model_channels, ...)
+                x = self.concat_emb(x)  # (B, model_channels, ...)
+
+
         if self.num_classes is not None:
             assert label.shape == (x.shape[0],)
             emb = emb + self.label_emb(label)
-
-        if context is not None:
-            context = self.multicnn(context)
-            x = torch.cat((x, context), dim=1)
-            x = self.concat_emb(x)
-
 
         for resnet, self_attn, downsample in self.downs:
             x = resnet(x, emb)
