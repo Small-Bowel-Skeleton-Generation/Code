@@ -22,6 +22,7 @@ from models.base_model import BaseModel
 from models.networks.diffusion_networks.graph_unet_union import UNet3DModel
 from models.model_utils import load_dualoctree, set_requires_grad
 from models.networks.diffusion_networks.ldm_diffusion_util import *
+from models.networks.dualoctree_networks import dual_octree
 
 from utils.distributed import get_rank
 from utils.util_dualoctree import calc_sdf, octree2split_small, split2octree_small
@@ -90,8 +91,11 @@ class TreeDiffuisonModel(BaseModel):
         unet_params = self.df_config.unet.params
         self.df = UNet3DModel(self.stage_flag, **unet_params).to(self.device)
 
+        # record z_shape
+        self.split_channel = 8
+        self.code_channel = self.vq_config.model.embed_dim
         z_sp_dim = 2 ** self.full_depth
-        self.z_shape = (self.vq_config.model.embed_dim, z_sp_dim, z_sp_dim, z_sp_dim)
+        self.z_shape = (self.split_channel, z_sp_dim, z_sp_dim, z_sp_dim)
 
         self.ema_df = copy.deepcopy(self.df)
         self.ema_df.to(self.device)
@@ -347,9 +351,14 @@ class TreeDiffuisonModel(BaseModel):
 
     @torch.no_grad()
     def _sample_loop(self, shape, ema=False, ddim_steps=200, label=None, cond_info=None,
-                     unet_type="lr", unet_lr=None, df_type="x0", truncated_index=0.0):
+                     unet_type="lr", unet_lr=None, df_type="x0", truncated_index=0.0, doctree=None):
         
-        batch_size = shape[0]
+        # For HR graph sampling, the input shape is (N_nodes, C), but timesteps/labels are per-batch.
+        # Use doctree.batch_size to drive the time schedule when doctree is provided.
+        if doctree is not None:
+            batch_size = doctree.batch_size
+        else:
+            batch_size = shape[0]
         time_pairs = self.get_sampling_timesteps(batch_size, device=self.device, steps=ddim_steps)
         
         context, octree_graph = None, None
@@ -366,7 +375,7 @@ class TreeDiffuisonModel(BaseModel):
             log_snr_t = self.log_snr(t)
             
             model = self.ema_df if ema else self.df
-            output = model(unet_type=unet_type, x=noised_data, doctree=None, timesteps=log_snr_t,
+            output = model(unet_type=unet_type, x=noised_data, doctree=doctree, timesteps=log_snr_t,
                            unet_lr=unet_lr, x_self_cond=x_start, label=label, context=context,
                            graph_octree=octree_graph)
 
@@ -377,10 +386,15 @@ class TreeDiffuisonModel(BaseModel):
                 x_start = output
             elif df_type == "eps":
                 alpha_t, sigma_t = log_snr_to_alpha_sigma(log_snr_t)
+                # For HR, alphas/sigmas should be scalars to broadcast over all nodes.
+                if unet_type == "hr":
+                    alpha_t, sigma_t = alpha_t[0], sigma_t[0]
                 x_start = (noised_data - output * sigma_t) / alpha_t.clamp(min=1e-8)
             
             log_snr_next = self.log_snr(t_next)
             alpha_next, sigma_next = log_snr_to_alpha_sigma(log_snr_next)
+            if unet_type == "hr":
+                alpha_next, sigma_next = alpha_next[0], sigma_next[0]
             noised_data = x_start * alpha_next + output * sigma_next
 
         return noised_data
@@ -415,22 +429,31 @@ class TreeDiffuisonModel(BaseModel):
         # Low-resolution sampling
         split_small = self._sample_loop(
             shape=(batch_size, *self.z_shape), ema=ema, ddim_steps=ddim_steps, label=label,
-            cond_info=cond_info, unet_type="lr", df_type=self.df_type[0], truncated_index=0.0
+            cond_info=cond_info, unet_type="lr", df_type=self.df_type[0], truncated_index=0.0, doctree=None
         )
 
         # High-resolution sampling
         octree_in = split2octree_small(split_small, self.input_depth, self.full_depth)
-        _, doctree_in = self.autoencoder_module.extract_code(octree_in)
+        doctree_in = dual_octree.DualOctree(octree_in)
+        doctree_in.post_processing_for_docnn()
         
-        unet_lr_out = self.df_module.unet_lr(split_small, None, None, label=label, context=cond_info.get('context'), graph_octree=cond_info.get('octree_graph'))
+        # For HR sampling, pass the LR UNet module (not its output) so HR UNet can call forward_as_middle internally
+        unet_lr_module = self.df_module.unet_lr
+        
+        # Get the total number of nodes for HR sampling
+        # doctree_in.total_num gives the total number of nodes at the current depth
+        hr_num_nodes = doctree_in.total_num
+        hr_shape_tuple = (hr_num_nodes, self.code_channel)
         
         sampled_code = self._sample_loop(
-            shape=doctree_in.nnum[self.small_depth], ema=ema, ddim_steps=ddim_steps, label=label,
-            cond_info=cond_info, unet_type="hr", unet_lr=unet_lr_out, df_type=self.df_type[1]
+            shape=hr_shape_tuple, ema=ema, ddim_steps=ddim_steps, label=label,
+            cond_info=cond_info, unet_type="hr", unet_lr=unet_lr_module, df_type=self.df_type[1], doctree=doctree_in
         )
 
-        # Decode and save
-        octree_out, signal = self.autoencoder_module.decode_code(sampled_code, doctree_in)
+        # Decode and save - decode_code returns a dictionary
+        output = self.autoencoder_module.decode_code(sampled_code, doctree_in)
+        octree_out = output['octree_out']
+        signal = output['signal']
         
         for i in range(batch_size):
             idx = save_index + i
@@ -446,12 +469,34 @@ class TreeDiffuisonModel(BaseModel):
 
             try:
                 num_pts = signal_np.shape[0]
+                cprint(f"Processing skeleton refinement for {num_pts} points", 'cyan')
+                
+                # Add downsampling for large point clouds to speed up processing
+                if num_pts > 20000:
+                    # Downsample to every 3rd point for very large clouds
+                    signal_np = signal_np[::3]
+                    num_pts = signal_np.shape[0]
+                    cprint(f"Downsampled to {num_pts} points for faster processing", 'yellow')
+                elif num_pts > 10000:
+                    # Downsample to every 2nd point for moderately large clouds
+                    signal_np = signal_np[::2]
+                    num_pts = signal_np.shape[0]
+                    cprint(f"Downsampled to {num_pts} points for faster processing", 'yellow')
+                
                 order = np.arange(num_pts).reshape(-1, 1)
                 signal_aug = np.concatenate([signal_np[:, :3], order], axis=1)
-                skeleton_curve = refine_signal_to_skeleton(signal_aug)
+                # Optimize parameters for faster processing
+                skeleton_curve = refine_signal_to_skeleton(
+                    signal_aug,
+                    max_edge_dist=0.2,
+                    recon_threshold=0.1,
+                    min_nodes=10,  # Reduced from default 20
+                    max_dist=0.4
+                )
                 sio.savemat(os.path.join(mesh_save_dir, 'skeleton.mat'), {'curve': skeleton_curve})
+                cprint(f"Skeleton refinement completed, output curve has {len(skeleton_curve)} points", 'green')
             except Exception as e:
-                cprint(f"Skeleton refinement failed: {e}", 'red')
+                cprint(f"Skeleton refinement failed for sample {idx}: {e}", 'red')
 
             # bbox = self.batch.get('bbox', [None]*batch_size)[i]
             # sdfs = self.get_sdfs(self.autoencoder_module.neural_mp, 1, bbox)
@@ -542,17 +587,38 @@ class TreeDiffuisonModel(BaseModel):
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict)
 
+        df_state_dict = state_dict.get('df', state_dict)
+        ema_df_state_dict = state_dict.get('ema_df', state_dict)
+
         if "unet_lr" in load_options:
-            load_part(df.unet_lr, state_dict['df']['unet_lr'])
-            load_part(ema_df.unet_lr, state_dict['ema_df']['unet_lr'])
-            cprint(f"[*] UNet-LR weights loaded from: {ckpt_path}", 'blue')
+            # Try new format: nested dict with 'unet_lr' key
+            if 'unet_lr' in df_state_dict:
+                load_part(df.unet_lr, df_state_dict['unet_lr'])
+                if 'unet_lr' in ema_df_state_dict:
+                    load_part(ema_df.unet_lr, ema_df_state_dict['unet_lr'])
+                cprint(f"[*] UNet-LR weights loaded from: {ckpt_path}", 'blue')
+            # Fallback to old format: flat dict with 'df_unet_lr' key
+            elif 'df_unet_lr' in state_dict:
+                load_part(df.unet_lr, state_dict['df_unet_lr'])
+                if 'ema_df_unet_lr' in state_dict:
+                    load_part(ema_df.unet_lr, state_dict['ema_df_unet_lr'])
+                cprint(f"[*] UNet-LR weights (old format) loaded from: {ckpt_path}", 'blue')
 
         if "unet_hr" in load_options:
-            load_part(df.unet_hr, state_dict['df']['unet_hr'])
-            load_part(ema_df.unet_hr, state_dict['ema_df']['unet_hr'])
-            cprint(f"[*] UNet-HR weights loaded from: {ckpt_path}", 'blue')
+            # Try new format
+            if 'unet_hr' in df_state_dict:
+                load_part(df.unet_hr, df_state_dict['unet_hr'])
+                if 'unet_hr' in ema_df_state_dict:
+                    load_part(ema_df.unet_hr, ema_df_state_dict['unet_hr'])
+                cprint(f"[*] UNet-HR weights loaded from: {ckpt_path}", 'blue')
+            # Fallback to old format
+            elif 'df_unet_hr' in state_dict:
+                load_part(df.unet_hr, state_dict['df_unet_hr'])
+                if 'ema_df_unet_hr' in state_dict:
+                    load_part(ema_df.unet_hr, state_dict['ema_df_unet_hr'])
+                cprint(f"[*] UNet-HR weights (old format) loaded from: {ckpt_path}", 'blue')
 
-        if "opt" in load_options and self.is_train:
+        if "opt" in load_options and self.is_train and 'opt' in state_dict:
             self.start_iter = state_dict.get('global_step', 0)
             self.optimizer.load_state_dict(state_dict['opt'])
             cprint(f"[*] Optimizer state restored from: {ckpt_path}", 'blue')
