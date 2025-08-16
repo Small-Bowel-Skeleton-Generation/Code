@@ -31,8 +31,20 @@ GPU_IDS=${4:-"0"} # Default to GPU 0 if not provided
 
 # --- Paths Configuration ---
 # !!! IMPORTANT: Please update these paths to match your environment !!!
-PYTHON_EXEC="python" # Assumes 'python' is in your PATH and points to the correct environment
-LOGS_DIR="logs"
+# PYTHON_EXEC="python" # Assumes 'python' is in your PATH and points to the correct environment
+PYTHON_EXEC="/home/data/anaconda3/envs/lzc_octfusion/bin/python" # Assumes 'python' is in your PATH and points to the correct environment
+
+# Set logs_dir based on mode and stage_flag
+# LR training -> logs/skeleton_diff_lr
+# HR generation -> logs/skeleton_diff_hr
+if [ "$MODE" = "train" ] && [ "$STAGE_FLAG" = "lr" ]; then
+    LOGS_DIR="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_diff_lr"
+elif [ "$MODE" = "generate" ] && [ "$STAGE_FLAG" = "hr" ]; then
+    LOGS_DIR="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_diff_hr"
+else
+    LOGS_DIR="logs"  # default fallback
+fi
+
 # Base directories for data and pretrained models.
 # These are example paths, please change them to your actual paths.
 DATA_BASE_DIR="/mnt/gemlab_data_2/User_database/liangzhichao"
@@ -43,9 +55,9 @@ COND_DIR_TRAIN="${DATA_BASE_DIR}/simulated_mask_data_8"
 COND_DIR_GENERATE="${DATA_BASE_DIR}/QC_mask_mat"
 
 # Checkpoint paths
-VQ_CKPT="${CODE_BASE_DIR}/logs/skeleton7_union/test_snet_lr1e-3/ckpt/vae_steps-latest.pth"
-PRETRAIN_CKPT="${CODE_BASE_DIR}/logs/skeleton7_union/union_2t_test_lr2e-4/ckpt/df_steps-latest.pth"
-CKPT_GENERATE="${CODE_BASE_DIR}/logs/skeleton7_rifle_union/union_3t_test_lr2e-4_2/ckpt/df_steps-latest.pth"
+VQ_CKPT="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_vae/ckpt/vae_steps-latest.pth"
+PRETRAIN_CKPT="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_diff_lr/ckpt/df_steps-latest.pth"
+CKPT_GENERATE="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_diff_lr/ckpt/df_steps-latest.pth"
 
 
 # --- Model Configuration ---
@@ -104,7 +116,12 @@ else
 fi
 
 # Set experiment name
-NAME="${CATEGORY}_union/${MODEL}_${NOTE}_lr${LR}"
+# For HR generate, flatten to logs_dir directly by using name='.'
+if [ "$MODE" = "generate" ] && [ "$STAGE_FLAG" = "hr" ]; then
+    NAME="."
+else
+    NAME="${CATEGORY}_union/${MODEL}_${NOTE}_lr${LR}"
+fi
 
 # Base command
 CMD="train.py \
@@ -147,6 +164,11 @@ else # generate or other modes
         CMD="${CMD} --ckpt ${CKPT_GENERATE}"
         echo "Running with ckpt: ${CKPT_GENERATE}"
     fi
+fi
+
+# Ensure generate mode does not trigger train-mode directory setup
+if [ "$MODE" = "generate" ]; then
+    CMD="${CMD} --isTrain False"
 fi
 
 # --- GPU and Launch Configuration ---
