@@ -32,7 +32,7 @@ GPU_IDS=${4:-"0"} # Default to GPU 0 if not provided
 # --- Paths Configuration ---
 # !!! IMPORTANT: Please update these paths to match your environment !!!
 # PYTHON_EXEC="python" # Assumes 'python' is in your PATH and points to the correct environment
-PYTHON_EXEC="/home/data/anaconda3/envs/lzc_octfusion/bin/python" # Assumes 'python' is in your PATH and points to the correct environment
+PYTHON_EXEC="./env/bin/python" # Assumes 'python' is in your PATH and points to the correct environment
 
 # Set logs_dir based on stage_flag only, so both train and generate for HR go to ./logs/skeleton_diff_hr
 if [ "$STAGE_FLAG" = "lr" ]; then
