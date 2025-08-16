@@ -29,11 +29,11 @@ GPU_IDS=${3:-"0"} # Default to GPU 0 if not provided
 # !!! IMPORTANT: Please update these paths to match your environment !!!
 PYTHON_EXEC="python" # Assumes 'python' is in your PATH
 # Set logs_dir based on the model type - VAE training goes to logs/skeleton_vae
-LOGS_DIR="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_vae"
-CODE_BASE_DIR="/home/data/liangzhichao/Code/octfusion-main" # Example path
+LOGS_DIR="./logs/skeleton_vae"
+CODE_BASE_DIR="home/Code/" # Example path
 
 # Checkpoint path for VQ model (used in generation)
-VQ_CKPT="/home/data/liangzhichao/Code/Tree-diffuison-update/results/skeleton_vae/ckpt/vae_steps-latest.pth"
+VQ_CKPT="./logs/skeleton_vae/ckpt/vae_steps-latest.pth"
 
 # --- Model Configuration ---
 MODEL='vae'
