@@ -128,35 +128,8 @@ def generate_diffusion_samples(opt, model):
         model.batch_size = 1
         category = random.choice(list(category_5_to_label.keys())) if opt.category == "im_5" else opt.category
         
-        model.sample(split_small=split_small, category=category, prefix='results', ema=False,
-                     ddim_steps=200, clean=False, save_index=result_index, cond=opt.cond,
-                     cond_dir=opt.cond_dir, iter_i=i)
+        model.sample(category=category, prefix='results', ema=False, save_index=result_index, iter_i=i, cond=opt.cond, cond_dir=opt.cond_dir)
         pbar.update(1)
-
-
-def backup_source_files(opt):
-    """Backs up essential source files to the experiment directory."""
-    expr_dir = os.path.join(opt.logs_dir, opt.name)
-    os.makedirs(expr_dir, exist_ok=True)
-    
-    files_to_backup = [
-        inspect.getfile(create_model.__globals__[opt.model.capitalize() + 'Model']),
-        "datasets/dualoctree_snet.py",
-        "train.py"
-    ]
-    
-    if opt.model != "vae" and hasattr(create_model(opt).df_module, '__class__'):
-         files_to_backup.append(inspect.getfile(create_model(opt).df_module.__class__))
-
-    if opt.vq_cfg:
-        files_to_backup.append(opt.vq_cfg)
-    if opt.df_cfg:
-        files_to_backup.append(opt.df_cfg)
-
-    for file_path in files_to_backup:
-        if os.path.exists(file_path):
-            destination_path = os.path.join(expr_dir, os.path.basename(file_path))
-            os.system(f'cp {file_path} {destination_path}')
 
 
 def main():
@@ -180,7 +153,29 @@ def main():
     visualizer = Visualizer(opt)
     if get_rank() == 0:
         visualizer.setup_io()
-        backup_source_files(opt)
+        
+        # Backup source files
+        expr_dir = os.path.join(opt.logs_dir, opt.name)
+        os.makedirs(expr_dir, exist_ok=True)
+
+        files_to_backup = [
+            inspect.getfile(model.__class__),
+            "datasets/dualoctree_snet.py",
+            "train.py"
+        ]
+
+        if opt.model != "vae" and hasattr(model, 'df_module') and hasattr(model.df_module, '__class__'):
+            files_to_backup.append(inspect.getfile(model.df_module.__class__))
+
+        if opt.vq_cfg:
+            files_to_backup.append(opt.vq_cfg)
+        if opt.df_cfg:
+            files_to_backup.append(opt.df_cfg)
+
+        for file_path in files_to_backup:
+            if os.path.exists(file_path):
+                destination_path = os.path.join(expr_dir, os.path.basename(file_path))
+                os.system(f'cp {file_path} {destination_path}')
 
     if opt.mode == 'train':
         train_loader, test_loader = config_dataloader(opt)
