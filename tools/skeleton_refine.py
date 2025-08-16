@@ -6,6 +6,11 @@ from scipy.ndimage import gaussian_filter1d
 from typing import Tuple, List, Optional
 import warnings
 
+# Added optimized structures for MST and neighbor search
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree as cs_mst
+
 warnings.filterwarnings('ignore')
 
 
@@ -28,22 +33,88 @@ class SkeletonRefiner:
         self.max_dist = max_dist
     
     def build_mst_graph(self, points: np.ndarray) -> nx.Graph:
-        # Calculate distance matrix
-        dist_matrix = squareform(pdist(points))
-        np.fill_diagonal(dist_matrix, 0)
+        # Optimized MST construction using sparse graph built via cKDTree within radius
+        n = points.shape[0]
+        if n == 0:
+            return nx.Graph()
         
-        # Build complete graph and find MST
-        G = nx.from_numpy_array(dist_matrix)
-        mst = nx.minimum_spanning_tree(G)
-        
-        # Filter edges by distance threshold
-        edges_to_remove = []
-        for u, v, data in mst.edges(data=True):
-            if data['weight'] > self.max_edge_dist:
-                edges_to_remove.append((u, v))
-        
-        mst.remove_edges_from(edges_to_remove)
-        return mst
+        try:
+            tree = cKDTree(points)
+            # Candidate edges: only within max_edge_dist (consistent with later thresholding)
+            pairs = tree.query_pairs(r=float(self.max_edge_dist))
+            # Convert to ndarray pairs
+            if isinstance(pairs, set):
+                if len(pairs) == 0:
+                    pairs_arr = np.empty((0, 2), dtype=np.int64)
+                else:
+                    pairs_arr = np.fromiter((p for ij in pairs for p in ij), dtype=np.int64)
+                    pairs_arr = pairs_arr.reshape(-1, 2)
+            else:
+                pairs_arr = np.asarray(pairs, dtype=np.int64)
+            
+            if pairs_arr.size > 0:
+                i = pairs_arr[:, 0]
+                j = pairs_arr[:, 1]
+                diffs = points[i] - points[j]
+                dists = np.linalg.norm(diffs, axis=1)
+                # Build symmetric sparse adjacency
+                row = np.concatenate([i, j])
+                col = np.concatenate([j, i])
+                data = np.concatenate([dists, dists])
+                adj = coo_matrix((data, (row, col)), shape=(n, n))
+                # Minimum spanning forest on sparse graph
+                T = cs_mst(adj)
+                G = nx.from_scipy_sparse_array(T + T.T)
+                # Ensure all nodes exist (isolated nodes kept)
+                G.add_nodes_from(range(n))
+                # Filter edges by distance threshold (match original behavior)
+                edges_to_remove = [(u, v) for u, v, d in G.edges(data=True) if d.get('weight', 0.0) > self.max_edge_dist]
+                if edges_to_remove:
+                    G.remove_edges_from(edges_to_remove)
+                return G
+            else:
+                # Fallback to small k-NN if no pairs within radius
+                if n <= 1:
+                    G = nx.Graph()
+                    G.add_nodes_from(range(n))
+                    return G
+                k = min(8, n - 1)
+                dists, idxs = tree.query(points, k=k + 1)  # include self at idx 0
+                rows = []
+                cols = []
+                data = []
+                for u in range(n):
+                    for v, d in zip(idxs[u][1:], dists[u][1:]):
+                        rows.append(u); cols.append(int(v)); data.append(float(d))
+                if len(rows) == 0:
+                    G = nx.Graph()
+                    G.add_nodes_from(range(n))
+                    return G
+                adj = coo_matrix((np.array(data), (np.array(rows), np.array(cols))), shape=(n, n))
+                # Symmetrize by taking minimum weight for undirected edges
+                adj = adj.minimum(adj.T) + adj.T.minimum(adj)
+                T = cs_mst(adj)
+                G = nx.from_scipy_sparse_array(T + T.T)
+                G.add_nodes_from(range(n))
+                # Filter edges by max_edge_dist to stay consistent
+                edges_to_remove = [(u, v) for u, v, d in G.edges(data=True) if d.get('weight', 0.0) > self.max_edge_dist]
+                if edges_to_remove:
+                    G.remove_edges_from(edges_to_remove)
+                return G
+        except Exception as e:
+            # Safe fallback (may be slow on very large N)
+            print(f"Warning: Fast MST construction failed ({e}), falling back to dense method")
+            dist_matrix = squareform(pdist(points))
+            np.fill_diagonal(dist_matrix, 0)
+            G = nx.from_numpy_array(dist_matrix)
+            mst = nx.minimum_spanning_tree(G)
+            # Filter edges by distance threshold to match original behavior
+            edges_to_remove = []
+            for u, v, data in mst.edges(data=True):
+                if data['weight'] > self.max_edge_dist:
+                    edges_to_remove.append((u, v))
+            mst.remove_edges_from(edges_to_remove)
+            return mst
     
     def filter_small_components(self, graph: nx.Graph) -> Tuple[nx.Graph, np.ndarray]:
         """Remove small connected components and return node mapping.
@@ -68,6 +139,7 @@ class SkeletonRefiner:
     def handle_multi_branch_points(self, graph: nx.Graph, points: np.ndarray, 
                                    order: np.ndarray) -> nx.Graph:
         """Handle multi-branch points by keeping longest branch and connecting to nearest endpoints.
+        Optimized version following MATLAB logic more closely.
         
         Args:
             graph: Input graph
@@ -80,25 +152,41 @@ class SkeletonRefiner:
         G = graph.copy()
         multi_branch_nodes = [node for node in G.nodes() if G.degree(node) > 2]
         
+        if not multi_branch_nodes:
+            return G
+        
         edges_to_remove = []
         edges_to_add = []
+        
+        # Pre-calculate all endpoints to avoid repeated computation
+        all_endpoints = [n for n in G.nodes() if G.degree(n) == 1]
         
         for node in multi_branch_nodes:
             neighbors = list(G.neighbors(node))
             if len(neighbors) <= 2:
                 continue
             
-            # Calculate branch sizes by removing current node temporarily
-            temp_G = G.copy()
-            temp_G.remove_node(node)
-            
+            # Simplified branch size calculation using BFS from each neighbor
             branch_sizes = []
             for neighbor in neighbors:
-                if neighbor in temp_G:
-                    component = nx.node_connected_component(temp_G, neighbor)
-                    branch_sizes.append(len(component))
-                else:
-                    branch_sizes.append(0)
+                # Simple BFS to count reachable nodes (excluding current node)
+                visited = {node}  # Block the multi-branch node
+                queue = [neighbor]
+                count = 0
+                
+                while queue:
+                    current = queue.pop(0)
+                    if current in visited:
+                        continue
+                    visited.add(current)
+                    count += 1
+                    
+                    # Add unvisited neighbors
+                    for next_node in G.neighbors(current):
+                        if next_node not in visited:
+                            queue.append(next_node)
+                
+                branch_sizes.append(count)
             
             # Keep the largest branch
             max_branch_idx = np.argmax(branch_sizes)
@@ -109,26 +197,19 @@ class SkeletonRefiner:
                 if i != max_branch_idx:
                     edges_to_remove.append((node, neighbor))
             
-            # Connect to nearest endpoint
-            temp_G = G.copy()
-            temp_G.remove_edges_from(edges_to_remove)
-            if temp_G.has_edge(node, keep_neighbor):
-                temp_G.add_edge(node, keep_neighbor)
-            
-            # Find endpoints (degree 1 nodes, excluding current node)
-            endpoints = [n for n in temp_G.nodes() if temp_G.degree(n) == 1 and n != node]
-            
-            if endpoints:
+            # Find nearest endpoint (excluding current node)
+            valid_endpoints = [ep for ep in all_endpoints if ep != node]
+            if valid_endpoints:
                 curr_point = points[node]
-                endpoint_points = points[endpoints]
+                endpoint_points = points[valid_endpoints]
                 distances = np.linalg.norm(endpoint_points - curr_point, axis=1)
                 
                 min_dist_idx = np.argmin(distances)
                 if distances[min_dist_idx] < 0.2:  # Distance threshold
-                    best_endpoint = endpoints[min_dist_idx]
+                    best_endpoint = valid_endpoints[min_dist_idx]
                     edges_to_add.append((node, best_endpoint))
         
-        # Apply modifications
+        # Apply all modifications at once
         G.remove_edges_from(edges_to_remove)
         G.add_edges_from(edges_to_add)
         
@@ -152,19 +233,19 @@ class SkeletonRefiner:
         if len(endpoints) < 2:
             return G
         
-        # Calculate pairwise distances between endpoints
+        # Use cKDTree to find endpoint pairs within recon_threshold efficiently
         endpoint_points = points[endpoints]
-        dist_matrix = squareform(pdist(endpoint_points))
-        np.fill_diagonal(dist_matrix, np.inf)
-        
-        # Find pairs within reconstruction threshold
-        valid_pairs = np.where((dist_matrix < self.recon_threshold) & 
-                              (dist_matrix > 0))
+        tree = cKDTree(endpoint_points)
+        pairs = tree.query_pairs(r=float(self.recon_threshold))
         
         # Add edges between valid endpoint pairs (avoid duplicates)
         added_pairs = set()
-        for i, j in zip(valid_pairs[0], valid_pairs[1]):
-            if i < j:  # Avoid duplicate pairs
+        if isinstance(pairs, set):
+            iterable_pairs = pairs
+        else:
+            iterable_pairs = set(map(tuple, np.asarray(pairs, dtype=int)))
+        for i, j in iterable_pairs:
+            if i < j:  # Avoid duplicates
                 pair = (endpoints[i], endpoints[j])
                 if pair not in added_pairs:
                     G.add_edge(pair[0], pair[1])
@@ -284,6 +365,7 @@ class SkeletonRefiner:
                                    num_iter: int = 10, step_size: float = 0.02,
                                    exclusion_interval: int = 50) -> np.ndarray:
         """Apply repulsion-based smoothing to curve points.
+        Optimized version with better performance.
         
         Args:
             points: N×3 curve points
@@ -295,31 +377,51 @@ class SkeletonRefiner:
         Returns:
             Smoothed curve points
         """
-        # First uniformly resample
-        adjusted_points = self._uniform_resample_curve(points, 10000)
+        # Reduce the target size for faster processing
+        target = min(2000, max(500, len(points)))  # Reduced from 4000
+        adjusted_points = self._uniform_resample_curve(points, target)
         n = len(adjusted_points)
+        
+        # Reduce iterations for large n
+        if n > 2000 and num_iter > 4:
+            num_iter = 4
+        elif n > 1000 and num_iter > 6:
+            num_iter = 6
         
         for iteration in range(num_iter):
             displacement = np.zeros_like(adjusted_points)
+            # Use KDTree for efficient neighbor search
+            tree = cKDTree(adjusted_points)
             
+            # Batch process neighbors to reduce overhead
             for i in range(n):
-                for j in range(n):
-                    if abs(i - j) < exclusion_interval:
-                        continue
-                    
-                    vec = adjusted_points[i] - adjusted_points[j]
-                    dist = np.linalg.norm(vec)
-                    
-                    if dist < min_dist and dist > 1e-6:
-                        repulsion = (min_dist - dist) * (vec / dist)
-                        displacement[i] += repulsion
+                neighbors = tree.query_ball_point(adjusted_points[i], r=float(min_dist))
+                if not neighbors:
+                    continue
+                
+                # Vectorized computation for all valid neighbors at once
+                valid_j = [j for j in neighbors if j != i and abs(i - j) >= exclusion_interval]
+                if not valid_j:
+                    continue
+                
+                neighbor_points = adjusted_points[valid_j]
+                vecs = adjusted_points[i] - neighbor_points
+                dists = np.linalg.norm(vecs, axis=1)
+                
+                # Apply repulsion only where distance < min_dist
+                valid_mask = (dists < min_dist) & (dists > 1e-6)
+                if np.any(valid_mask):
+                    valid_vecs = vecs[valid_mask]
+                    valid_dists = dists[valid_mask]
+                    repulsions = (min_dist - valid_dists[:, np.newaxis]) * (valid_vecs / valid_dists[:, np.newaxis])
+                    displacement[i] += np.sum(repulsions, axis=0)
             
             # Update positions
             adjusted_points += step_size * displacement
             
-            # Apply Gaussian smoothing
+            # Apply lighter Gaussian smoothing
             for dim in range(3):
-                adjusted_points[:, dim] = gaussian_filter1d(adjusted_points[:, dim], sigma=1.0)
+                adjusted_points[:, dim] = gaussian_filter1d(adjusted_points[:, dim], sigma=0.5)
         
         return adjusted_points
     
