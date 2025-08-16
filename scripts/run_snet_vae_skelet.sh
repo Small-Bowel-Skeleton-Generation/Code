@@ -28,11 +28,12 @@ GPU_IDS=${3:-"0"} # Default to GPU 0 if not provided
 # --- Paths Configuration ---
 # !!! IMPORTANT: Please update these paths to match your environment !!!
 PYTHON_EXEC="python" # Assumes 'python' is in your PATH
-LOGS_DIR="logs"
+# Set logs_dir based on the model type - VAE training goes to logs/skeleton_vae
+LOGS_DIR="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_vae"
 CODE_BASE_DIR="/home/data/liangzhichao/Code/octfusion-main" # Example path
 
 # Checkpoint path for VQ model (used in generation)
-VQ_CKPT="${CODE_BASE_DIR}/logs/skeleton7_union/test_snet_lr1e-3/ckpt/vae_steps-latest.pth"
+VQ_CKPT="/home/data/liangzhichao/Code/Tree-diffuison-update/results/skeleton_vae/ckpt/vae_steps-latest.pth"
 
 # --- Model Configuration ---
 MODEL='vae'
@@ -82,7 +83,7 @@ NAME="${CATEGORY}_union/${NOTE}_${DATASET_MODE}_lr${LR}"
 if [ "$MODE" = "generate" ] || [ "$MODE" = "inference_vae" ]; then
     DF_CFG="${LOGS_DIR}/${NAME}/${DF_YAML}"
     VQ_CFG="${LOGS_DIR}/${NAME}/${VQ_YAML}"
-    CKPT="${LOGS_DIR}/${NAME}/ckpt/df_steps-latest.pth"
+    CKPT="${LOGS_DIR}/${NAME}/ckpt/vae_steps-latest.pth"
 fi
 
 # Base command
