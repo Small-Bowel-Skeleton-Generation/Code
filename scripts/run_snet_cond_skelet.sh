@@ -32,7 +32,7 @@ GPU_IDS=${4:-"0"} # Default to GPU 0 if not provided
 # --- Paths Configuration ---
 # !!! IMPORTANT: Please update these paths to match your environment !!!
 # PYTHON_EXEC="python" # Assumes 'python' is in your PATH and points to the correct environment
-PYTHON_EXEC="./env/bin/python" # Assumes 'python' is in your PATH and points to the correct environment
+PYTHON_EXEC="/home/data/anaconda3/envs/lzc_octfusion/bin/python" # Assumes 'python' is in your PATH and points to the correct environment
 
 # Set logs_dir based on stage_flag only, so both train and generate for HR go to ./logs/skeleton_diff_hr
 if [ "$STAGE_FLAG" = "lr" ]; then
@@ -43,17 +43,17 @@ fi
 
 # Base directories for data and pretrained models.
 # These are example paths, please change them to your actual paths.
-DATA_BASE_DIR="/mnt/data/"
-CODE_BASE_DIR="/home/code/"
+DATA_BASE_DIR="/mnt/gemlab_data_2/User_database/liangzhichao"
+CODE_BASE_DIR="/home/data/liangzhichao/Code/octfusion-main"
 
 # Conditional data directory
-COND_DIR_TRAIN="${DATA_BASE_DIR}/mask_data"
-COND_DIR_GENERATE="${DATA_BASE_DIR}/mask_mat"
+COND_DIR_TRAIN="${DATA_BASE_DIR}/simulated_mask_data_8"
+COND_DIR_GENERATE="${DATA_BASE_DIR}/QC_mask_mat"
 
 # Checkpoint paths
-VQ_CKPT="./logs/skeleton_vae/ckpt/vae_steps-latest.pth"
-PRETRAIN_CKPT="./logs/skeleton_diff_lr/ckpt/df_steps-latest.pth"
-CKPT_GENERATE="./logs/skeleton_diff_lr/ckpt/df_steps-latest.pth"
+VQ_CKPT="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_vae/ckpt/vae_steps-latest.pth"
+PRETRAIN_CKPT="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_diff_lr/ckpt/df_steps-latest.pth"
+CKPT_GENERATE="/home/data/liangzhichao/Code/Tree-diffuison-update/logs/skeleton_diff_lr/ckpt/df_steps-latest.pth"
 
 
 # --- Model Configuration ---
@@ -175,7 +175,7 @@ echo "[*] Starting on $(hostname), GPU(s): ${GPU_IDS}"
 echo "[*] Command to be executed:"
 
 if [ ${NUM_GPUS} -gt 1 ]; then
-    HOST_NODE_ADDR="localhost:27000"
+    HOST_NODE_ADDR="localhost:$(shuf -i 10000-65535 -n 1)"
     LAUNCH_CMD="--nnodes=1 --nproc_per_node=${NUM_GPUS} --rdzv-backend=c10d --rdzv-endpoint=${HOST_NODE_ADDR}"
     
     echo "CUDA_VISIBLE_DEVICES=${GPU_IDS} ${PYTHON_EXEC} -m torch.distributed.launch ${LAUNCH_CMD} ${CMD}"
@@ -183,7 +183,8 @@ if [ ${NUM_GPUS} -gt 1 ]; then
 else
     # For single GPU, we can also use torch.distributed.launch for consistency
     # if the training script is designed for it.
-    LAUNCH_CMD="--nnodes=1 --nproc_per_node=1"
+    MASTER_PORT=$(shuf -i 10000-65535 -n 1)
+    LAUNCH_CMD="--nnodes=1 --nproc_per_node=1 --master_port=${MASTER_PORT}"
     echo "CUDA_VISIBLE_DEVICES=${GPU_IDS} ${PYTHON_EXEC} -m torch.distributed.launch ${LAUNCH_CMD} ${CMD}"
     CUDA_VISIBLE_DEVICES=${GPU_IDS} ${PYTHON_EXEC} -m torch.distributed.launch ${LAUNCH_CMD} ${CMD}
 fi
